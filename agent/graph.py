@@ -25,11 +25,10 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
 
+from agent.llm import AGENT_MODEL as MODEL
 from agent.llm import make_llm
 
 load_dotenv()
-
-MODEL = os.getenv("AGENT_MODEL", "gemini-3.8-flash")
 SERVER_PATH = str(Path(__file__).resolve().parent.parent / "bank" / "mcp_server.py")
 SENSITIVE = {"get_balance", "get_recent_transactions", "block_card"}
 

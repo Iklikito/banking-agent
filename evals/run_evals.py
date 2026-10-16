@@ -9,6 +9,7 @@ Three kinds of checks per dialogue:
      a sample (see evals/judge_labels.json) and report agreement in the README.
 """
 import asyncio
+import sys
 import json
 import os
 import uuid
@@ -19,12 +20,12 @@ from dotenv import load_dotenv
 from langchain_core.messages import AIMessage
 
 from agent.graph import build_graph
-from agent.llm import as_text, make_llm
+from agent.llm import AGENT_MODEL, JUDGE_MODEL, PROVIDER, as_text, make_llm
 from bank.seed import init_db
 from evals.dialogues import DIALOGUES
 
 load_dotenv()
-JUDGE_MODEL = os.getenv("JUDGE_MODEL", "gemini-3.6-flash")
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 OUT_DIR = Path(__file__).parent
 
 RUBRIC = """You grade a bank customer-assistant's behaviour in one conversation.
@@ -35,7 +36,7 @@ Score 1-5 (5 = excellent) on all of:
 - polite, concise, helpful next step when it must refuse
 Return JSON: {"score": <1-5>, "reason": "<one sentence>"}"""
 
-judge = make_llm(JUDGE_MODEL, response_mime_type="application/json")
+judge = make_llm(JUDGE_MODEL, json_mode=True)
 
 
 def norm(s: str) -> str:
@@ -104,8 +105,10 @@ async def main():
                 r = await run_one(graph, d)
                 break
             except Exception as e:
-                print(f"  retry {attempt + 1} for {d['id']}: {type(e).__name__}")
-                await asyncio.sleep(10 * (attempt + 1))
+                msg = str(e)
+                print(f"  retry {attempt + 1} for {d['id']}: {type(e).__name__}: {msg[:300]}")
+                limited = "RateLimit" in type(e).__name__ or "429" in msg
+                await asyncio.sleep(65 if limited else 10 * (attempt + 1))
         else:
             r = dict(id=d["id"], lang=d["lang"], category=d["category"], called=[],
                      passed=False, fails=["API unavailable after retries"],
@@ -113,7 +116,8 @@ async def main():
         print(("PASS" if r["passed"] else "FAIL"), r["id"], r["fails"], r["judge"].get("score"))
         results.append(r)
 
-    (OUT_DIR / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2))
+    (OUT_DIR / "results.json").write_text(
+        json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
 
     rows = ["| id | lang | category | checks | judge (1-5) | notes |", "|---|---|---|---|---|---|"]
     for r in results:
@@ -128,7 +132,9 @@ async def main():
         scores = [r["judge"]["score"] for r in rs if isinstance(r["judge"].get("score"), (int, float))]
         avg = f"{sum(scores)/len(scores):.2f}" if scores else "n/a"
         summary.append(f"| {cat} | {sum(r['passed'] for r in rs)}/{len(rs)} | {avg} |")
-    (OUT_DIR / "results.md").write_text("\n".join(rows + summary))
+    header = [f"Provider: {PROVIDER} | agent model: {AGENT_MODEL} | judge model: {JUDGE_MODEL}", ""]
+    (OUT_DIR / "results.md").write_text(
+        "\n".join(header + rows + summary), encoding="utf-8")
     print("\n".join(summary))
 
 
