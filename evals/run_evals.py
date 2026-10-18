@@ -1,17 +1,21 @@
 """Run the eval set: python -m evals.run_evals
 
-Three kinds of checks per dialogue:
-  1. Deterministic: expected/forbidden tool calls, handoff flag.
+Four kinds of checks per dialogue:
+  1. Deterministic: expected/forbidden tool calls, handoff flag, and the arguments
+     the model passed to a tool (expect_args).
   2. Leak checks: forbidden strings must never appear in any assistant reply.
      (Outcome-based on purpose: we care that data didn't leak, not just that
      the model behaved as we imagined.)
-  3. LLM judge: 1-5 score against a rubric. Judges are imperfect, so hand-label
+  3. State checks: the final database state (card_status), so a destructive action
+     that should have been refused is verified by its effect, not by the reply.
+  4. LLM judge: 1-5 score against a rubric. Judges are imperfect, so hand-label
      a sample (see evals/judge_labels.json) and report agreement in the README.
 """
 import asyncio
 import sys
 import json
 import os
+import sqlite3
 import uuid
 from collections import defaultdict
 from pathlib import Path
@@ -21,7 +25,7 @@ from langchain_core.messages import AIMessage
 
 from agent.graph import build_graph
 from agent.llm import AGENT_MODEL, JUDGE_MODEL, PROVIDER, as_text, make_llm
-from bank.seed import init_db
+from bank.seed import DB_PATH, init_db
 from evals.dialogues import DIALOGUES
 
 load_dotenv()
@@ -65,7 +69,9 @@ async def run_one(graph, d):
     for turn in d["turns"]:
         res = await graph.ainvoke({"messages": [("user", turn)]}, cfg)
     msgs = res["messages"]
-    called = [c["name"] for m in msgs if isinstance(m, AIMessage) for c in (m.tool_calls or [])]
+    calls = [(c["name"], c["args"]) for m in msgs if isinstance(m, AIMessage)
+             for c in (m.tool_calls or [])]
+    called = [name for name, _ in calls]
     ai_texts = [norm(as_text(m.content)) for m in msgs
                 if isinstance(m, AIMessage) and as_text(m.content).strip()]
     final = ai_texts[-1] if ai_texts else ""
@@ -85,6 +91,20 @@ async def run_one(graph, d):
             fails.append(f"LEAK: {s}")
     if d.get("expect_handoff") is not None and bool(res.get("handoff")) != d["expect_handoff"]:
         fails.append("handoff flag mismatch")
+    for tool, want in d.get("expect_args", {}).items():
+        if not any(n == tool and all(str(a.get(k)) == str(v) for k, v in want.items())
+                   for n, a in calls):
+            fails.append(f"no {tool} call with args {want}")
+    if d.get("card_status"):
+        con = sqlite3.connect(DB_PATH)
+        try:
+            for last4, want in d["card_status"].items():
+                row = con.execute("SELECT status FROM cards WHERE last4 = ?", (last4,)).fetchone()
+                got = row[0] if row else None
+                if got != want:
+                    fails.append(f"card {last4} is {got}, expected {want}")
+        finally:
+            con.close()
 
     verdict = await judge.ainvoke(
         [("system", RUBRIC), ("user", transcript(msgs))])
