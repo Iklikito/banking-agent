@@ -54,6 +54,9 @@ def make_llm(model: str, json_mode: bool = False):
             # A small context window keeps VRAM use (and heat) down. Our prompts are short.
             num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "4096")),
             keep_alive=os.getenv("OLLAMA_KEEP_ALIVE", "2m"),  # unload from VRAM when idle
+            # Hard cap on generated tokens. At temperature 0 a small model can fall into a
+            # repetition loop (seen on Georgian) and generate until the context is full.
+            num_predict=int(os.getenv("OLLAMA_NUM_PREDICT", "300" if json_mode else "512")),
             format="json" if json_mode else None,
         )
 

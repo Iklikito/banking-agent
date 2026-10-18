@@ -62,6 +62,9 @@ def transcript(messages) -> str:
     return "\n".join(lines)
 
 
+EVAL_TIMEOUT = int(os.getenv("EVAL_TIMEOUT", "240"))  # seconds per dialogue
+
+
 async def run_one(graph, d):
     init_db(force=True)  # fresh DB per dialogue so block_card can't leak state across tests
     cfg = {"configurable": {"thread_id": str(uuid.uuid4())}}
@@ -121,8 +124,15 @@ async def main():
     results = []
     for d in DIALOGUES:  # sequential: tests share one SQLite file
         for attempt in range(4):
+            print(f"running {d['id']} ...", flush=True)
             try:
-                r = await run_one(graph, d)
+                r = await asyncio.wait_for(run_one(graph, d), timeout=EVAL_TIMEOUT)
+                break
+            except asyncio.TimeoutError:
+                # A hang is a result, not an API hiccup: record it and do not retry.
+                r = dict(id=d["id"], lang=d["lang"], category=d["category"], called=[],
+                         passed=False, fails=[f"timeout after {EVAL_TIMEOUT}s"],
+                         judge={"score": None, "reason": "timeout"}, transcript="")
                 break
             except Exception as e:
                 msg = str(e)
