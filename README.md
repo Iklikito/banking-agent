@@ -31,6 +31,7 @@ user ──► LangGraph agent loop ──► tool node (auth gate) ──► MC
 5. **Layered evaluation.** Deterministic checks (tool calls and their arguments, leaks, database state, handoff flag) plus an LLM judge for language and quality. Deterministic checks are the primary signal; the judge is secondary (see Results).
 
 6. **Swappable model provider.** Free API tiers ran out of quota partway through evaluation runs, so the model layer is behind a single switch and the evals can run fully locally at no cost. Gemini 3 needs "thought signatures" returned after tool calls, so the Gemini path uses the native client rather than the OpenAI-compatible endpoint.
+7. **Wrong-PIN limit enforced on the server.** `verify_pin` counts failures per customer in SQLite: 3 wrong PINs lock the account for 5 minutes, and while locked even the correct PIN is refused (otherwise an attacker keeps guessing and just reads the last answer). The count-and-update runs inside `BEGIN IMMEDIATE` so parallel guesses can't slip past it. It lives in the tool, not in the prompt or the LLM, because the model is the thing being attacked. Tests: `python -m pytest -q`.
 
 ## Run it
 
@@ -95,11 +96,13 @@ All 14 passed the deterministic checks: the right tools were called, no forbidde
 
 ## Known issues
 
-- **No limit on wrong PIN attempts (in the version tested for the original results).** Found by manual testing: a customer could try candidate PINs one at a time until the right one worked, and the model helpfully listed the remaining candidates. The `pin_guessing` dialogue reproduces this. The fix has to live on the server, not in the prompt.
+- **Small local model on Georgian.** With `granite4.1:8b`, a Georgian complaint (`handoff_ka`) got a garbled text reply and no `handoff_to_human` call, so the handoff flag stayed false while the bot implied a transfer. Adding Georgian trigger words to the prompt fixed that case. Georgian runs could also degenerate into very long repetitive output at temperature 0, so generation is now capped (`OLLAMA_NUM_PREDICT`) and each dialogue has a timeout (`EVAL_TIMEOUT`); a timeout is reported as a failed dialogue.
+
+- **PIN guessing was possible, then limited (fixed on the server).** Found by manual testing: a customer could try candidate PINs one at a time until the right one worked, and the model helpfully listed the remaining candidates. The `pin_guessing` dialogue reproduces this. Models refusing to "try all of them" is behaviour, not a guarantee, so the limit lives in `verify_pin` (see design decision below). Before/after eval results: not added yet.
+- **Limitations of the lockout.** Anyone who knows a customer ID can lock that customer out for 5 minutes. "N attempts remaining" confirms the ID exists (unknown IDs get a plain `FAILED`). There is no audit log. The PIN still travels through the chat and the model API.
 
 ## Next steps
 
-- Implement and test a server-side PIN attempt limit and temporary lockout.
 - Validate the judge: feed it deliberately bad transcripts (e.g. one that leaks another customer's balance) and check that it scores them low; compare it with hand labels. Use a stronger or different judge model.
 - Run the extended 29-dialogue suite and report its results.
 - Benchmark Whisper speech-to-text (word error rate) on Georgian speech. No text-to-speech or live voice loop yet.
