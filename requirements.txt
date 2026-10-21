@@ -3,5 +3,7 @@ langchain-core
 langchain-google-genai
 langchain-ollama
 langchain-mcp-adapters
-mcp
+mcp<2
 python-dotenv
+pytest
+pytest-asyncio

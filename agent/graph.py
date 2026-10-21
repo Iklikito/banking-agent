@@ -11,8 +11,12 @@ Design rationale
    model to ask for another account's data therefore still fails.
 3. The graph is the classic agent loop (agent -> tools -> agent), kept small
    so every decision is easy to explain and to test.
+4. Credentials must come from the customer. verify_pin is refused unless the PIN and the
+   customer ID appear in something the customer typed, so the model cannot invent a
+   credential (a manual eval showed it guessing a PIN on its first try, and being right).
 """
 import os
+import re
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -26,7 +30,7 @@ from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
 
 from agent.llm import AGENT_MODEL as MODEL
-from agent.llm import make_llm
+from agent.llm import as_text, make_llm
 
 load_dotenv()
 SERVER_PATH = str(Path(__file__).resolve().parent.parent / "bank" / "mcp_server.py")
@@ -69,14 +73,35 @@ def _text(result) -> str:
     return str(result)
 
 
-async def build_graph():
-    client = MultiServerMCPClient(
-        {"bank": {"command": "python", "args": [SERVER_PATH], "transport": "stdio"}}
-    )
-    mcp_tools = await client.get_tools()
-    tools = {t.name: t for t in mcp_tools}
-    tools["handoff_to_human"] = handoff_to_human
-    llm = make_llm(MODEL).bind_tools(list(tools.values()))
+def _customer_text(messages) -> str:
+    """Everything the customer has typed so far (not the model's words, not tool output)."""
+    return "\n".join(as_text(m.content) for m in messages if m.type == "human")
+
+
+def _typed(value, text: str, digits_only: bool = False) -> bool:
+    """True if `value` appears in `text` as a standalone token.
+
+    A PIN must not be a piece of a longer number (1234 inside 12345), and an ID such as
+    C001 must not be a piece of a longer word. IDs are matched case-insensitively.
+    """
+    value = str(value or "").strip()
+    if not value:
+        return False
+    edge = r"\d" if digits_only else r"[A-Za-z0-9]"
+    return re.search(rf"(?<!{edge}){re.escape(value)}(?!{edge})", text, re.IGNORECASE) is not None
+
+
+async def build_graph(llm=None, tools=None):
+    """llm and tools can be injected for offline tests; by default the configured model
+    and the MCP bank server are used."""
+    if tools is None:
+        client = MultiServerMCPClient(
+            {"bank": {"command": "python", "args": [SERVER_PATH], "transport": "stdio"}}
+        )
+        mcp_tools = await client.get_tools()
+        tools = {t.name: t for t in mcp_tools}
+        tools["handoff_to_human"] = handoff_to_human
+    llm = (llm or make_llm(MODEL)).bind_tools(list(tools.values()))
 
     async def agent(state: State):
         reply = await llm.ainvoke([SystemMessage(SYSTEM_PROMPT)] + state["messages"])
@@ -86,11 +111,22 @@ async def build_graph():
         last = state["messages"][-1]
         cid = state.get("customer_id")
         handoff = state.get("handoff", False)
+        typed = _customer_text(state["messages"])
         out = []
         for call in last.tool_calls:
             name, args = call["name"], dict(call["args"])
             if name not in tools:
                 out.append(ToolMessage(f"ERROR: unknown tool {name}", tool_call_id=call["id"]))
+                continue
+            if name == "verify_pin" and not (
+                _typed(args.get("pin"), typed, digits_only=True)
+                and _typed(args.get("customer_id"), typed)
+            ):
+                # Not sent to the server, so an invented guess doesn't count toward a lockout.
+                out.append(ToolMessage(
+                    "DENIED: the customer ID and PIN must be ones the customer typed in this "
+                    "conversation. Do not guess. Ask the customer for them in your reply and "
+                    "wait for their answer.", tool_call_id=call["id"]))
                 continue
             if name in SENSITIVE:
                 if not cid:
